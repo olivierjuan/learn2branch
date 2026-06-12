@@ -9,8 +9,8 @@ from time import strftime
 from shutil import copyfile
 import gzip
 
-import tensorflow as tf
-import tensorflow.contrib.eager as tfe
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 import utilities
 from utilities import log
@@ -18,14 +18,22 @@ from utilities import log
 from utilities_tf import load_batch_gcnn
 
 
-def load_batch_tf(x):
-    return tf.py_func(
-        load_batch_gcnn,
-        [x],
-        [tf.float32, tf.int32, tf.float32, tf.float32, tf.int32, tf.int32, tf.int32, tf.int32, tf.int32, tf.float32])
+class GCNNDataset(Dataset):
+    def __init__(self, sample_files):
+        self.sample_files = sample_files
+
+    def __len__(self):
+        return len(self.sample_files)
+
+    def __getitem__(self, idx):
+        return self.sample_files[idx]
 
 
-def pretrain(model, dataloader):
+def collate_fn(batch):
+    return load_batch_gcnn(batch)
+
+
+def pretrain(model, dataloader, device):
     """
     Pre-normalizes a model (i.e., PreNormLayer layers) over the given samples.
 
@@ -33,8 +41,8 @@ def pretrain(model, dataloader):
     ----------
     model : model.BaseModel
         A base model, which may contain some model.PreNormLayer layers.
-    dataloader : tf.data.Dataset
-        Dataset to use for pre-training the model.
+    dataloader : DataLoader
+        Dataset loader to use for pre-training the model.
     Return
     ------
     number of PreNormLayer layers processed.
@@ -42,12 +50,13 @@ def pretrain(model, dataloader):
     model.pre_train_init()
     i = 0
     while True:
-        for batch in dataloader:
-            c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = batch
-            batched_states = (c, ei, ev, v, n_cs, n_vs)
+        with torch.no_grad():
+            for batch in dataloader:
+                c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = [b.to(device) for b in batch]
+                batched_states = (c, ei, ev, v, n_cs, n_vs)
 
-            if not model.pre_train(batched_states, tf.convert_to_tensor(True)):
-                break
+                if not model.pre_train(batched_states):
+                    break
 
         res = model.pre_train_next()
         if res is None:
@@ -60,43 +69,45 @@ def pretrain(model, dataloader):
     return i
 
 
-def process(model, dataloader, top_k, optimizer=None):
+def process(model, dataloader, top_k, device, optimizer=None):
     mean_loss = 0
     mean_kacc = np.zeros(len(top_k))
 
     n_samples_processed = 0
     for batch in dataloader:
-        c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = batch
-        batched_states = (c, ei, ev, v, tf.reduce_sum(n_cs, keepdims=True), tf.reduce_sum(n_vs, keepdims=True))  # prevent padding
-        batch_size = len(n_cs.numpy())
+        c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = [b.to(device) for b in batch]
+        batched_states = (c, ei, ev, v, torch.sum(n_cs, dim=0, keepdim=True), torch.sum(n_vs, dim=0, keepdim=True))  # prevent padding
+        batch_size = len(n_cs)
 
         if optimizer:
-            with tf.GradientTape() as tape:
-                logits = model(batched_states, tf.convert_to_tensor(True)) # training mode
-                logits = tf.expand_dims(tf.gather(tf.squeeze(logits, 0), cands), 0)  # filter candidate variables
-                logits = model.pad_output(logits, n_cands.numpy())  # apply padding now
-                loss = tf.losses.sparse_softmax_cross_entropy(labels=best_cands, logits=logits)
-            grads = tape.gradient(target=loss, sources=model.variables)
-            optimizer.apply_gradients(zip(grads, model.variables))
+            optimizer.zero_grad()
+            logits = model(batched_states, training=True) # training mode
+            logits = torch.squeeze(logits, 0)[cands.long()].unsqueeze(0)  # filter candidate variables
+            logits = model.pad_output(logits, n_cands)  # apply padding now
+            loss = torch.nn.functional.cross_entropy(logits, best_cands.long())
+            loss.backward()
+            optimizer.step()
         else:
-            logits = model(batched_states, tf.convert_to_tensor(False))  # eval mode
-            logits = tf.expand_dims(tf.gather(tf.squeeze(logits, 0), cands), 0)  # filter candidate variables
-            logits = model.pad_output(logits, n_cands.numpy())  # apply padding now
-            loss = tf.losses.sparse_softmax_cross_entropy(labels=best_cands, logits=logits)
+            with torch.no_grad():
+                logits = model(batched_states, training=False)  # eval mode
+                logits = torch.squeeze(logits, 0)[cands.long()].unsqueeze(0)  # filter candidate variables
+                logits = model.pad_output(logits, n_cands)  # apply padding now
+                loss = torch.nn.functional.cross_entropy(logits, best_cands.long())
 
-        true_scores = model.pad_output(tf.reshape(cand_scores, (1, -1)), n_cands)
-        true_bestscore = tf.reduce_max(true_scores, axis=-1, keepdims=True)
-        true_scores = true_scores.numpy()
-        true_bestscore = true_bestscore.numpy()
+        with torch.no_grad():
+            true_scores = model.pad_output(cand_scores.reshape(1, -1), n_cands)
+            true_bestscore = torch.max(true_scores, dim=-1, keepdim=True)[0]
+            true_scores = true_scores.cpu().numpy()
+            true_bestscore = true_bestscore.cpu().numpy()
 
         kacc = []
         for k in top_k:
-            pred_top_k = tf.nn.top_k(logits, k=k)[1].numpy()
+            pred_top_k = torch.topk(logits, k=k, dim=-1)[1].cpu().numpy()
             pred_top_k_true_scores = np.take_along_axis(true_scores, pred_top_k, axis=1)
             kacc.append(np.mean(np.any(pred_top_k_true_scores == true_bestscore, axis=1)))
         kacc = np.asarray(kacc)
 
-        mean_loss += loss.numpy() * batch_size
+        mean_loss += loss.item() * batch_size
         mean_kacc += kacc * batch_size
         n_samples_processed += batch_size
 
@@ -154,7 +165,7 @@ if __name__ == '__main__':
     }
     problem_folder = problem_folders[args.problem]
 
-    running_dir = f"trained_models/{args.problem}/{args.model}/{args.seed}"
+    running_dir = f"trained_models/{args.problem}/{args.model}_torch/{args.seed}"
 
     os.makedirs(running_dir, exist_ok=True)
 
@@ -174,18 +185,18 @@ if __name__ == '__main__':
     log(f"gpu: {args.gpu}", logfile)
     log(f"seed {args.seed}", logfile)
 
-    ### NUMPY / TENSORFLOW SETUP ###
+    ### PYTORCH SETUP ###
     if args.gpu == -1:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        device = torch.device('cpu')
     else:
         os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    tf.enable_eager_execution(config)
-    tf.executing_eagerly()
+        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
     rng = np.random.RandomState(args.seed)
-    tf.set_random_seed(rng.randint(np.iinfo(int).max))
+    torch.manual_seed(rng.randint(np.iinfo(int).max))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(rng.randint(np.iinfo(int).max))
 
     ### SET-UP DATASET ###
     train_files = list(pathlib.Path(f'data/samples/{problem_folder}/train').glob('sample_*.pkl'))
@@ -220,50 +231,40 @@ if __name__ == '__main__':
     train_files = [str(x) for x in train_files]
     valid_files = [str(x) for x in valid_files]
 
-    valid_data = tf.data.Dataset.from_tensor_slices(valid_files)
-    valid_data = valid_data.batch(valid_batch_size)
-    valid_data = valid_data.map(load_batch_tf)
-    valid_data = valid_data.prefetch(1)
+    valid_dataset = GCNNDataset(valid_files)
+    valid_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, shuffle=False, collate_fn=collate_fn)
 
     pretrain_files = [f for i, f in enumerate(train_files) if i % 10 == 0]
-    pretrain_data = tf.data.Dataset.from_tensor_slices(pretrain_files)
-    pretrain_data = pretrain_data.batch(pretrain_batch_size)
-    pretrain_data = pretrain_data.map(load_batch_tf)
-    pretrain_data = pretrain_data.prefetch(1)
+    pretrain_dataset = GCNNDataset(pretrain_files)
+    pretrain_loader = DataLoader(pretrain_dataset, batch_size=pretrain_batch_size, shuffle=False, collate_fn=collate_fn)
 
     ### MODEL LOADING ###
     sys.path.insert(0, os.path.abspath(f'models/{args.model}'))
     import model
     importlib.reload(model)
     model = model.GCNPolicy()
+    model.to(device)
     del sys.path[0]
 
     ### TRAINING LOOP ###
-    optimizer = tf.train.AdamOptimizer(learning_rate=lambda: lr)  # dynamic LR trick
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_loss = np.inf
     for epoch in range(max_epochs + 1):
         log(f"EPOCH {epoch}...", logfile)
-        epoch_loss_avg = tfe.metrics.Mean()
-        epoch_accuracy = tfe.metrics.Accuracy()
 
         # TRAIN
         if epoch == 0:
-            n = pretrain(model=model, dataloader=pretrain_data)
+            n = pretrain(model=model, dataloader=pretrain_loader, device=device)
             log(f"PRETRAINED {n} LAYERS", logfile)
-            # model compilation
-            model.call = tfe.defun(model.call, input_signature=model.input_signature)
         else:
-            # bugfix: tensorflow's shuffle() seems broken...
             epoch_train_files = rng.choice(train_files, epoch_size * batch_size, replace=True)
-            train_data = tf.data.Dataset.from_tensor_slices(epoch_train_files)
-            train_data = train_data.batch(batch_size)
-            train_data = train_data.map(load_batch_tf)
-            train_data = train_data.prefetch(1)
-            train_loss, train_kacc = process(model, train_data, top_k, optimizer)
+            train_dataset = GCNNDataset(epoch_train_files)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+            train_loss, train_kacc = process(model, train_loader, top_k, device, optimizer)
             log(f"TRAIN LOSS: {train_loss:0.3f} " + "".join([f" acc@{k}: {acc:0.3f}" for k, acc in zip(top_k, train_kacc)]), logfile)
 
         # TEST
-        valid_loss, valid_kacc = process(model, valid_data, top_k, None)
+        valid_loss, valid_kacc = process(model, valid_loader, top_k, device, None)
         log(f"VALID LOSS: {valid_loss:0.3f} " + "".join([f" acc@{k}: {acc:0.3f}" for k, acc in zip(top_k, valid_kacc)]), logfile)
 
         if valid_loss < best_loss:
@@ -278,9 +279,10 @@ if __name__ == '__main__':
                 break
             if plateau_count % patience == 0:
                 lr *= 0.2
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
                 log(f"  {plateau_count} epochs without improvement, decreasing learning rate to {lr}", logfile)
 
     model.restore_state(os.path.join(running_dir, 'best_params.pkl'))
-    valid_loss, valid_kacc = process(model, valid_data, top_k, None)
+    valid_loss, valid_kacc = process(model, valid_loader, top_k, device, None)
     log(f"BEST VALID LOSS: {valid_loss:0.3f} " + "".join([f" acc@{k}: {acc:0.3f}" for k, acc in zip(top_k, valid_kacc)]), logfile)
-

@@ -1,0 +1,5 @@
+cython<3
+numpy
+scipy
+setuptools
+PySCIPOpt @ git+https://github.com/ds4dm/PySCIPOpt.git@ml-branching

@@ -2,7 +2,7 @@ import pickle
 import gzip
 import numpy as np
 
-import tensorflow as tf
+import torch
 
 
 def load_batch_gcnn(sample_files):
@@ -58,15 +58,15 @@ def load_batch_gcnn(sample_files):
     cand_scoress = np.concatenate(cand_scoress, axis=0)
 
     # convert to tensors
-    c_features = tf.convert_to_tensor(c_features, dtype=tf.float32)
-    e_indices = tf.convert_to_tensor(e_indices, dtype=tf.int32)
-    e_features = tf.convert_to_tensor(e_features, dtype=tf.float32)
-    v_features = tf.convert_to_tensor(v_features, dtype=tf.float32)
-    n_cs_per_sample = tf.convert_to_tensor(n_cs_per_sample, dtype=tf.int32)
-    n_vs_per_sample = tf.convert_to_tensor(n_vs_per_sample, dtype=tf.int32)
-    candss = tf.convert_to_tensor(candss, dtype=tf.int32)
-    cand_choices = tf.convert_to_tensor(cand_choices, dtype=tf.int32)
-    cand_scoress = tf.convert_to_tensor(cand_scoress, dtype=tf.float32)
-    n_cands_per_sample = tf.convert_to_tensor(n_cands_per_sample, dtype=tf.int32)
+    c_features = torch.tensor(c_features, dtype=torch.float32)
+    e_indices = torch.tensor(e_indices, dtype=torch.int32)
+    e_features = torch.tensor(e_features, dtype=torch.float32)
+    v_features = torch.tensor(v_features, dtype=torch.float32)
+    n_cs_per_sample = torch.tensor(n_cs_per_sample, dtype=torch.int32)
+    n_vs_per_sample = torch.tensor(n_vs_per_sample, dtype=torch.int32)
+    candss = torch.tensor(candss, dtype=torch.int32)
+    cand_choices = torch.tensor(cand_choices, dtype=torch.int32)
+    cand_scoress = torch.tensor(cand_scoress, dtype=torch.float32)
+    n_cands_per_sample = torch.tensor(n_cands_per_sample, dtype=torch.int32)
 
     return c_features, e_indices, e_features, v_features, n_cs_per_sample, n_vs_per_sample, n_cands_per_sample, candss, cand_choices, cand_scoress

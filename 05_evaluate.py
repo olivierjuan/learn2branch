@@ -9,8 +9,7 @@ import pickle
 
 import pyscipopt as scip
 
-import tensorflow as tf
-import tensorflow.contrib.eager as tfe
+import torch
 
 import svmrank
 
@@ -19,16 +18,19 @@ import utilities
 
 class PolicyBranching(scip.Branchrule):
 
-    def __init__(self, policy):
+    def __init__(self, policy, device):
         super().__init__()
 
         self.policy_type = policy['type']
         self.policy_name = policy['name']
+        self.device = device
 
         if self.policy_type == 'gcnn':
             model = policy['model']
             model.restore_state(policy['parameters'])
-            self.policy = tfe.defun(model.call, input_signature=model.input_signature)
+            # Since self.device can change per policy, make sure model is on the right device
+            model.to(device)
+            self.policy = model
 
         elif self.policy_type == 'internal':
             self.policy = policy['name']
@@ -76,15 +78,16 @@ class PolicyBranching(scip.Branchrule):
                 # convert state to tensors
                 c, e, v = state
                 state = (
-                    tf.convert_to_tensor(c['values'], dtype=tf.float32),
-                    tf.convert_to_tensor(e['indices'], dtype=tf.int32),
-                    tf.convert_to_tensor(e['values'], dtype=tf.float32),
-                    tf.convert_to_tensor(v['values'], dtype=tf.float32),
-                    tf.convert_to_tensor([c['values'].shape[0]], dtype=tf.int32),
-                    tf.convert_to_tensor([v['values'].shape[0]], dtype=tf.int32),
+                    torch.tensor(c['values'], dtype=torch.float32, device=self.device),
+                    torch.tensor(e['indices'], dtype=torch.int32, device=self.device),
+                    torch.tensor(e['values'], dtype=torch.float32, device=self.device),
+                    torch.tensor(v['values'], dtype=torch.float32, device=self.device),
+                    torch.tensor([c['values'].shape[0]], dtype=torch.int32, device=self.device),
+                    torch.tensor([v['values'].shape[0]], dtype=torch.int32, device=self.device),
                 )
 
-                var_logits = self.policy(state, tf.convert_to_tensor(False)).numpy().squeeze(0)
+                with torch.no_grad():
+                    var_logits = self.policy(state, training=False).cpu().numpy().squeeze(0)
 
                 candidate_scores = var_logits[candidate_mask]
                 best_var = candidate_vars[candidate_scores.argmax()]
@@ -98,6 +101,7 @@ class PolicyBranching(scip.Branchrule):
                     candidate_states.append(utilities.compute_extended_variable_features(state, candidate_mask))
                 if self.feat_specs['type'] in ('all', 'khalil'):
                     candidate_states.append(utilities.extract_khalil_variable_features(self.model, candidate_vars, self.khalil_root_buffer))
+
                 candidate_states = np.concatenate(candidate_states, axis=1)
 
                 # feature preprocessing
@@ -204,17 +208,15 @@ if __name__ == '__main__':
     print(f"gpu: {args.gpu}")
     print(f"time limit: {time_limit} s")
 
-    ### TENSORFLOW SETUP ###
+    ### PYTORCH SETUP ###
     if args.gpu == -1:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        device = torch.device('cpu')
     else:
         os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    tf.enable_eager_execution(config)
-    tf.executing_eagerly()
+        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
-    # load and assign tensorflow models to policies (share models and update parameters)
+    # load and assign models to policies (share models and update parameters)
     loaded_models = {}
     for policy in branching_policies:
         if policy['type'] == 'gcnn':
@@ -225,6 +227,7 @@ if __name__ == '__main__':
                 loaded_models[policy['name']] = model.GCNPolicy()
                 del sys.path[0]
             policy['model'] = loaded_models[policy['name']]
+            policy['model'].to(device)
 
     # load ml-competitor models
     for policy in branching_policies:
@@ -270,7 +273,10 @@ if __name__ == '__main__':
             print(f"{instance['type']}: {instance['path']}...")
 
             for policy in branching_policies:
-                tf.set_random_seed(policy['seed'])
+                rng = np.random.RandomState(policy['seed'])
+                torch.manual_seed(rng.randint(np.iinfo(int).max))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(rng.randint(np.iinfo(int).max))
 
                 m = scip.Model()
                 m.setIntParam('display/verblevel', 0)
@@ -279,7 +285,7 @@ if __name__ == '__main__':
                 m.setIntParam('timing/clocktype', 1)  # 1: CPU user seconds, 2: wall clock time
                 m.setRealParam('limits/time', time_limit)
 
-                brancher = PolicyBranching(policy)
+                brancher = PolicyBranching(policy, device)
                 m.includeBranchrule(
                     branchrule=brancher,
                     name=f"{policy['type']}:{policy['name']}",
@@ -322,4 +328,3 @@ if __name__ == '__main__':
                 m.freeProb()
 
                 print(f"  {policy['type']}:{policy['name']} {policy['seed']} - {nnodes} ({nnodes+2*(ndomchgs+ncutoffs)}) nodes {nlps} lps {stime:.2f} ({walltime:.2f} wall {proctime:.2f} proc) s. {status}")
-

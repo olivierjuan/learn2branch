@@ -30,7 +30,7 @@ if isinstance(seeds, (int, str)):
 rule all:
     input:
         # TensorFlow 2 baseline runs (Keras)
-        expand("trained_models/{problem}/{model}/{seed}/best_params.pkl",
+        expand("trained_models/{problem}/{model}_torch/{seed}/best_params.pkl",
                problem=problems,
                model=models,
                seed=seeds),
@@ -75,7 +75,7 @@ rule train_gcnn:
     input:
         "data/samples/{problem}/.done_generate_dataset"
     output:
-        "trained_models/{problem}/{model}/{seed}/best_params.pkl"
+        "trained_models/{problem}/{model}_torch/{seed}/best_params.pkl"
     resources:
         slurm_partition="an",
         runtime=360,
@@ -85,8 +85,7 @@ rule train_gcnn:
         gres="gpu:1"
     shell:
         """
-        source .venv/bin/activate
-        export LD_LIBRARY_PATH=/home/D01856/scratch/cuda/9.0/lib64
+        source venv39/bin/activate
         export https_proxy=http://sefront3.selena.hpc.edf.fr:13131
         export http_proxy=http://sefront3.selena.hpc.edf.fr:13131
         export ftp_proxy=http://sefront3.selena.hpc.edf.fr:13131

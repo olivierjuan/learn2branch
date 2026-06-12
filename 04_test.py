@@ -9,14 +9,25 @@ import pickle
 import pathlib
 import gzip
 
-import tensorflow as tf
-import tensorflow.contrib.eager as tfe
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 import svmrank
 
 import utilities
 
 from utilities_tf import load_batch_gcnn
+
+
+class GCNNDataset(Dataset):
+    def __init__(self, sample_files):
+        self.sample_files = sample_files
+
+    def __len__(self):
+        return len(self.sample_files)
+
+    def __getitem__(self, idx):
+        return self.sample_files[idx]
 
 
 def load_batch_flat(sample_files, feats_type, augment_feats, normalize_feats):
@@ -42,66 +53,72 @@ def load_batch_flat(sample_files, feats_type, augment_feats, normalize_feats):
 
 
 def padding(output, n_vars_per_sample, fill=-1e8):
-    n_vars_max = tf.reduce_max(n_vars_per_sample)
+    if torch.is_tensor(n_vars_per_sample):
+        n_vars_list = n_vars_per_sample.cpu().tolist()
+    else:
+        n_vars_list = list(n_vars_per_sample)
 
-    output = tf.split(
-        value=output,
-        num_or_size_splits=n_vars_per_sample,
-        axis=1,
-    )
-    output = tf.concat([
-        tf.pad(
-            x,
-            paddings=[[0, 0], [0, n_vars_max - tf.shape(x)[1]]],
-            mode='CONSTANT',
-            constant_values=fill)
-        for x in output
-    ], axis=0)
+    n_vars_max = max(n_vars_list)
 
-    return output
+    chunks = torch.split(output, n_vars_list, dim=1)
+    padded_chunks = []
+    for x in chunks:
+        padding_size = n_vars_max - x.shape[1]
+        if padding_size > 0:
+            padded_x = torch.nn.functional.pad(x, (0, padding_size), value=fill)
+        else:
+            padded_x = x
+        padded_chunks.append(padded_x)
+
+    return torch.cat(padded_chunks, dim=0)
 
 
-def process(policy, dataloader, top_k):
+def process(policy, dataloader, top_k, device):
     mean_kacc = np.zeros(len(top_k))
 
     n_samples_processed = 0
     for batch in dataloader:
 
         if policy['type'] == 'gcnn':
-            c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = batch
+            c, ei, ev, v, n_cs, n_vs, n_cands, cands, best_cands, cand_scores = [b.to(device) for b in batch]
 
-            pred_scores = policy['model']((c, ei, ev, v, tf.reduce_sum(n_cs, keepdims=True), tf.reduce_sum(n_vs, keepdims=True)), tf.convert_to_tensor(False))
-
-            # filter candidate variables
-            pred_scores = tf.expand_dims(tf.gather(tf.squeeze(pred_scores, 0), cands), 0)
+            with torch.no_grad():
+                pred_scores = policy['model']((c, ei, ev, v, torch.sum(n_cs, dim=0, keepdim=True), torch.sum(n_vs, dim=0, keepdim=True)), training=False)
+                # filter candidate variables
+                pred_scores = torch.squeeze(pred_scores, 0)[cands.long()].unsqueeze(0)
 
         elif policy['type'] == 'ml-competitor':
             cand_feats, n_cands, best_cands, cand_scores = batch
 
             # move to numpy
-            cand_feats = cand_feats.numpy()
-            n_cands = n_cands.numpy()
+            if torch.is_tensor(cand_feats):
+                cand_feats = cand_feats.numpy()
+            if torch.is_tensor(n_cands):
+                n_cands = n_cands.numpy()
 
             # feature normalization
             cand_feats = (cand_feats - policy['feat_shift']) / policy['feat_scale']
 
             pred_scores = policy['model'].predict(cand_feats)
 
-            # move back to TF
-            pred_scores = tf.convert_to_tensor(pred_scores.reshape((1, -1)), dtype=tf.float32)
+            # move back to PyTorch
+            pred_scores = torch.tensor(pred_scores.reshape((1, -1)), dtype=torch.float32, device=device)
+            n_cands = torch.tensor(n_cands, device=device)
+            best_cands = torch.tensor(best_cands, device=device)
+            cand_scores = torch.tensor(cand_scores, device=device)
 
         # padding
         pred_scores = padding(pred_scores, n_cands)
-        true_scores = padding(tf.reshape(cand_scores, (1, -1)), n_cands)
-        true_bestscore = tf.reduce_max(true_scores, axis=-1, keepdims=True)
+        true_scores = padding(cand_scores.reshape(1, -1), n_cands)
+        true_bestscore = torch.max(true_scores, dim=-1, keepdim=True)[0]
 
-        assert all(true_bestscore.numpy() == np.take_along_axis(true_scores.numpy(), best_cands.numpy().reshape((-1, 1)), axis=1))
+        assert all(true_bestscore.cpu().numpy() == np.take_along_axis(true_scores.cpu().numpy(), best_cands.cpu().numpy().reshape((-1, 1)), axis=1))
 
         kacc = []
         for k in top_k:
-            pred_top_k = tf.nn.top_k(pred_scores, k=k)[1].numpy()
-            pred_top_k_true_scores = np.take_along_axis(true_scores.numpy(), pred_top_k, axis=1)
-            kacc.append(np.mean(np.any(pred_top_k_true_scores == true_bestscore.numpy(), axis=1)))
+            pred_top_k = torch.topk(pred_scores, k=k, dim=-1)[1].cpu().numpy()
+            pred_top_k_true_scores = np.take_along_axis(true_scores.cpu().numpy(), pred_top_k, axis=1)
+            kacc.append(np.mean(np.any(pred_top_k_true_scores == true_bestscore.cpu().numpy(), axis=1)))
         kacc = np.asarray(kacc)
 
         batch_size = int(n_cands.shape[0])
@@ -155,15 +172,13 @@ if __name__ == '__main__':
     result_file = result_file + '.csv'
     os.makedirs('results', exist_ok=True)
 
-    ### TENSORFLOW SETUP ###
+    ### PYTORCH SETUP ###
     if args.gpu == -1:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        device = torch.device('cpu')
     else:
         os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    tf.enable_eager_execution(config)
-    tf.executing_eagerly()
+        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
     test_files = list(pathlib.Path(f"data/samples/{problem_folder}/test").glob('sample_*.pkl'))
     test_files = [str(x) for x in test_files]
@@ -186,7 +201,9 @@ if __name__ == '__main__':
             print(f"{policy_type}:{policy_name}...")
             for seed in seeds:
                 rng = np.random.RandomState(seed)
-                tf.set_random_seed(rng.randint(np.iinfo(int).max))
+                torch.manual_seed(rng.randint(np.iinfo(int).max))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(rng.randint(np.iinfo(int).max))
 
                 policy = {}
                 policy['name'] = policy_name
@@ -200,9 +217,7 @@ if __name__ == '__main__':
                     del sys.path[0]
                     policy['model'] = model.GCNPolicy()
                     policy['model'].restore_state(f"trained_models/{args.problem}/{policy['name']}/{seed}/best_params.pkl")
-                    policy['model'].call = tfe.defun(policy['model'].call, input_signature=policy['model'].input_signature)
-                    policy['batch_datatypes'] = [tf.float32, tf.int32, tf.float32,
-                            tf.float32, tf.int32, tf.int32, tf.int32, tf.int32, tf.int32, tf.float32]
+                    policy['model'].to(device)
                     policy['batch_fun'] = load_batch_gcnn
                 else:
                     # load feature normalization parameters
@@ -223,16 +238,22 @@ if __name__ == '__main__':
                     with open(f"trained_models/{args.problem}/{policy['name']}/{seed}/feat_specs.pkl", 'rb') as f:
                         feat_specs = pickle.load(f)
 
-                    policy['batch_datatypes'] = [tf.float32, tf.int32, tf.int32, tf.float32]
                     policy['batch_fun'] = lambda x: load_batch_flat(x, feat_specs['type'], feat_specs['augment'], feat_specs['qbnorm'])
 
-                test_data = tf.data.Dataset.from_tensor_slices(test_files)
-                test_data = test_data.batch(test_batch_size)
-                test_data = test_data.map(lambda x: tf.py_func(
-                    policy['batch_fun'], [x], policy['batch_datatypes']))
-                test_data = test_data.prefetch(2)
+                test_dataset = GCNNDataset(test_files)
+                
+                def test_collate_fn(batch):
+                    res = policy['batch_fun'](batch)
+                    return [torch.tensor(x) if not torch.is_tensor(x) else x for x in res]
+                
+                test_data = DataLoader(
+                    test_dataset,
+                    batch_size=test_batch_size,
+                    shuffle=False,
+                    collate_fn=test_collate_fn
+                )
 
-                test_kacc = process(policy, test_data, top_k)
+                test_kacc = process(policy, test_data, top_k, device)
                 print(f"  {seed} " + " ".join([f"acc@{k}: {100*acc:4.1f}" for k, acc in zip(top_k, test_kacc)]))
 
                 writer.writerow({
