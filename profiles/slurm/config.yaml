@@ -1,0 +1,37 @@
+# Snakemake SLURM profile configuration
+
+executor: slurm
+jobs: 64
+restart-times: 1
+keep-going: true
+printshellcmds: true
+latency-wait: 60
+slurm-logdir: "logs/slurm"
+slurm-pass-command-as-script: true
+slurm-jobstep-pass-command-as-script: true
+
+default-resources:
+  slurm_partition: "cn"
+  slurm_account: "rd"
+  runtime: 60
+  mem_mb: 10240
+  cpus_per_task: 1
+  slurm_extra: "--wckey=P12ES:TURING"
+
+set-resources:
+  - "aggregate:slurm_partition=bm"
+  - "aggregate:mem_mb=256000"
+  - "train:runtime=1200"
+  - "train:mem_mb=80000"
+  - "train:cpus_per_task=16"
+  - "train:slurm_partition=an"
+  - "train:slurm_extra=--wckey=P12ES:TURING"
+  - "train:gres=gpu:1"
+  - "train_v2:runtime=1200"
+  - "train_v2:mem_mb=80000"
+  - "train_v2:cpus_per_task=16"
+  - "train_v2:slurm_partition=an"
+  - "train_v2:slurm_extra=--wckey=P12ES:TURING --exclusive"
+  - "train_v2:gres=gpu:4"
+#  - "train:qos=an_preemptable"
+#  - "train:qos=an_short"
