@@ -85,7 +85,7 @@ rule train_gcnn:
         gres="gpu:1"
     shell:
         """
-        source .venv/bin/activate
+        source venv36/bin/activate
         export LD_LIBRARY_PATH=/home/D01856/scratch/cuda/9.0/lib64
         export https_proxy=http://sefront3.selena.hpc.edf.fr:13131
         export http_proxy=http://sefront3.selena.hpc.edf.fr:13131
