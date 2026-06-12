@@ -156,7 +156,7 @@ if __name__ == '__main__':
 
     running_dir = f"trained_models/{args.problem}/{args.model}/{args.seed}"
 
-    os.makedirs(running_dir)
+    os.makedirs(running_dir, exist_ok=True)
 
     ### LOG ###
     logfile = os.path.join(running_dir, 'log.txt')
